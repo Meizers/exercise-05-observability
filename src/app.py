@@ -1,5 +1,7 @@
+import time
 from datetime import datetime, timezone
-from fastapi import Depends, FastAPI, HTTPException, Response
+from fastapi import Depends, FastAPI, HTTPException, Request, Response
+from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, generate_latest
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 from src.database import Base, engine, get_db
@@ -8,6 +10,33 @@ from src.schemas import NodeCreate, NodeResponse, NodeUpdate
 
 Base.metadata.create_all(bind=engine)
 app = FastAPI()
+
+REQUESTS = Counter("http_requests_total", "HTTP requests handled", ["method", "endpoint", "status"])
+DURATION = Histogram("http_request_duration_seconds", "HTTP request latency", ["method", "endpoint"])
+ACTIVE_NODES = Gauge("active_nodes", "Registered nodes with status active")
+
+@app.middleware("http")
+async def track_requests(request: Request, call_next):
+    start = time.perf_counter()
+    status = 500  # kept if the handler raises
+    try:
+        response = await call_next(request)
+        status = response.status_code
+        return response
+    finally:
+        # Label by route template (/api/nodes/{name}), not raw path, to keep cardinality bounded.
+        route = request.scope.get("route")
+        endpoint = route.path if route else "unmatched"
+        DURATION.labels(request.method, endpoint).observe(time.perf_counter() - start)
+        REQUESTS.labels(request.method, endpoint, str(status)).inc()
+
+@app.get("/metrics")
+def metrics(db: Session = Depends(get_db)):
+    try:
+        ACTIVE_NODES.set(db.query(Node).filter(Node.status == "active").count())
+    except Exception:
+        pass  # still serve metrics while the db is down; the gauge keeps its last value
+    return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 @app.get("/health")
 def health(db: Session = Depends(get_db)):
